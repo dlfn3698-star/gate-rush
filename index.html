@@ -21,6 +21,10 @@
   button{border:0; border-radius:14px; padding:15px 30px; font-size:17px; font-weight:800; color:#fff;
     background:var(--accent); cursor:pointer}
   button:active{transform:translateY(1px)}
+  #runs{width:100%; max-width:300px; max-height:32vh; overflow:auto; font-size:14px; font-variant-numeric:tabular-nums}
+  #runs .row{display:flex; justify-content:space-between; gap:12px; padding:6px 10px; border-bottom:1px solid #222b37; color:var(--muted)}
+  #runs .row.cur{color:var(--ink); font-weight:800}
+  #runs .row.best b{color:#f5c518}
   kbd{background:#222b37; border-radius:5px; padding:1px 7px; font-size:12px; border:1px solid #30363d}
 </style>
 </head>
@@ -30,9 +34,9 @@
 <div class="overlay show" id="startO">
   <h1>GATE RUSH</h1>
   <p>대포를 좌우로 움직여 병사를 쏘세요. 병사가 <b style="color:#f5c518">배수 문</b>을 지나면 불어납니다.
-  <b style="color:#ef4444">붉은 군단</b>을 밀어내고 위쪽 적 기지를 부수면 승리.</p>
+  <b style="color:#ef4444">붉은 군단</b>을 밀어내고 위쪽 적 기지를 부수면 다음 스테이지. 방어선이 뚫리면 끝나고, 그때까지 적 기지에 입힌 피해 총합이 기록입니다.</p>
   <p>붉은 <b style="color:#ef4444">÷ 문</b>은 병사를 줄입니다. 적은 시간이 갈수록 많아져요.</p>
-  <p style="font-size:13px">드래그 / 마우스 이동, 또는 <kbd>←</kbd> <kbd>→</kbd> · 발사는 자동</p>
+  <p style="font-size:13px">드래그 / 마우스 이동, 또는 <kbd>←</kbd> <kbd>→</kbd> · 발사는 자동 · 일시중지 <kbd>P</kbd></p>
   <button id="startBtn">시작</button>
 </div>
 
@@ -40,7 +44,14 @@
   <h1 id="endTitle"></h1>
   <div class="big" id="endSub"></div>
   <p id="endMsg"></p>
+  <div id="runs"></div>
   <button id="again">다시</button>
+</div>
+
+<div class="overlay" id="pauseO">
+  <h1>일시중지</h1>
+  <p id="pauseMsg"></p>
+  <button id="resume">계속하기</button>
 </div>
 
 <script>
@@ -59,6 +70,9 @@ function resize(){
 window.addEventListener('resize',resize); resize();
 const rnd=Math.random;
 let G=null;
+const RUN={cleared:0};            // damage from stages already cleared in this run
+function score(){ return Math.round(RUN.cleared + (G? G.baseMax-Math.max(0,G.base) : 0)); }
+const PBTN={x:326,y:30,w:24,h:20};  // pause button (field coords)
 
 function gate(op,val,x0,x1,y,move){
   const g={op,val,x0,x1,y,flash:0};
@@ -209,11 +223,19 @@ function step(dt){
 // ---- input ----
 function setTarget(clientX){ if(G) G.tx=Math.max(22,Math.min(FW-22,(clientX-OX)/S)); }
 let drag=false;
-cv.addEventListener('pointerdown',e=>{drag=true; setTarget(e.clientX);});
+cv.addEventListener('pointerdown',e=>{
+  const fx=(e.clientX-OX)/S, fy=(e.clientY-OY)/S;
+  if(G&&G.state==='play'&&fx>=PBTN.x-6&&fx<=PBTN.x+PBTN.w+6&&fy>=PBTN.y-6&&fy<=PBTN.y+PBTN.h+6){ pause(); return; }
+  drag=true; setTarget(e.clientX);
+});
 window.addEventListener('pointermove',e=>{ if(drag||e.pointerType==='mouse') setTarget(e.clientX); });
 window.addEventListener('pointerup',()=>drag=false);
 const keys={};
-window.addEventListener('keydown',e=>{keys[e.key]=true;});
+window.addEventListener('keydown',e=>{
+  keys[e.key]=true;
+  if(e.key==='p'||e.key==='P'||e.key==='Escape'){ if(G&&G.state==='play') pause(); else if(G&&G.state==='pause') resume(); }
+});
+document.addEventListener('visibilitychange',()=>{ if(document.hidden&&G&&G.state==='play') pause(); });
 window.addEventListener('keyup',e=>{keys[e.key]=false;});
 
 // ---- draw ----
@@ -269,6 +291,10 @@ function draw(){
   ctx.fillText('적 기지 '+Math.max(0,Math.ceil(G.base)),FW/2,21.5);
   ctx.textAlign='left'; ctx.font='800 12px system-ui,sans-serif'; ctx.fillStyle='#fff';
   ctx.fillText('ST '+G.stage,16,21);
+  ctx.font='700 11px system-ui,sans-serif'; ctx.fillStyle='#fecaca'; ctx.fillText('기록 '+score(),16,40);
+  ctx.fillStyle='rgba(0,0,0,.4)'; rr(PBTN.x,PBTN.y,PBTN.w,PBTN.h,5); ctx.fill();
+  ctx.fillStyle='#fff'; ctx.fillRect(PBTN.x+8,PBTN.y+5,3,10); ctx.fillRect(PBTN.x+13,PBTN.y+5,3,10);
+  ctx.font='800 12px system-ui,sans-serif';
   let bw=0; for(const b of G.blues) bw+=b.w;
   ctx.textAlign='right'; ctx.fillText(Math.round(bw)+'',FW-16,21);
   // player hp
@@ -285,24 +311,55 @@ function frame(now){
 }
 const endO=document.getElementById('endO'), endTitle=document.getElementById('endTitle'),
       endSub=document.getElementById('endSub'), endMsg=document.getElementById('endMsg'), again=document.getElementById('again');
+const runsEl=document.getElementById('runs'), pauseO=document.getElementById('pauseO');
+// records of this visit: kept while the tab stays open (survives refresh), gone on a new visit
+let RUNS=[];
+try{ RUNS=JSON.parse(sessionStorage.getItem('gr_runs')||'[]'); }catch(e){ RUNS=[]; }
+function saveRuns(){ try{ sessionStorage.setItem('gr_runs',JSON.stringify(RUNS)); }catch(e){} }
+function showRuns(curIdx){
+  runsEl.textContent='';
+  if(!RUNS.length) return;
+  let best=0; RUNS.forEach((r,i)=>{ if(r.score>RUNS[best].score) best=i; });
+  for(let i=RUNS.length-1;i>=0;i--){
+    const r=RUNS[i], row=document.createElement('div');
+    row.className='row'+(i===curIdx?' cur':'')+(i===best?' best':'');
+    const l=document.createElement('span'); l.textContent=(i+1)+'번째 판 · ST '+r.stage;
+    const v=document.createElement('b'); v.textContent=r.score+(i===best?' ★':'');
+    row.appendChild(l); row.appendChild(v); runsEl.appendChild(row);
+  }
+}
+function pause(){
+  if(!G||G.state!=='play') return;
+  G.state='pause'; drag=false;
+  document.getElementById('pauseMsg').textContent='STAGE '+G.stage+' · 현재 기록 '+score();
+  pauseO.classList.add('show');
+}
+function resume(){ if(G&&G.state==='pause'){ pauseO.classList.remove('show'); G.state='play'; } }
+document.getElementById('resume').onclick=resume;
 function win(){
-  G.state='end';
-  try{ const b=Math.max(G.stage,+(localStorage.getItem('gr2_best')||0)); localStorage.setItem('gr2_best',b); }catch(e){}
-  endTitle.textContent='승리'; endTitle.className='win';
+  G.state='end'; G.base=0;
+  RUN.cleared+=G.baseMax;
+  const total=Math.round(RUN.cleared);
+  endTitle.textContent='기지 파괴'; endTitle.className='win';
   endSub.textContent='STAGE '+G.stage+' 돌파 · '+Math.round(G.t)+'초';
-  endMsg.textContent='다음 스테이지는 적이 더 빨리 불어나고 방해 문이 늘어납니다.';
+  endMsg.textContent='누적 기록 '+total+'. 다음 스테이지는 적이 더 빨리 불어납니다.';
+  runsEl.textContent='';
   again.textContent='다음 스테이지'; again.dataset.next=G.stage+1; endO.classList.add('show');
 }
 function lose(){
   G.state='end';
-  endTitle.textContent='패배'; endTitle.className='lose';
-  endSub.textContent='방어선이 뚫렸다';
-  endMsg.textContent='STAGE '+G.stage+'. 배수가 큰 문으로 병력을 불리되, 내려오는 적을 놓치지 마세요.';
-  again.textContent='재도전'; again.dataset.next=G.stage; endO.classList.add('show');
+  const final=score();
+  RUNS.push({stage:G.stage, score:final}); saveRuns();
+  endTitle.textContent='최종 기록'; endTitle.className='lose';
+  endSub.textContent=final+'';
+  endMsg.textContent='STAGE '+G.stage+'에서 방어선이 뚫렸습니다. 적 기지에 입힌 피해 총합입니다.';
+  showRuns(RUNS.length-1);
+  again.textContent='1스테이지부터 다시'; again.dataset.next=0; endO.classList.add('show');
 }
-document.getElementById('startBtn').onclick=()=>{ document.getElementById('startO').classList.remove('show'); newGame(1); };
-again.onclick=()=>{ endO.classList.remove('show'); newGame(+again.dataset.next||1); };
-if(location.hash==='#dev') window.__start=(s)=>{ document.getElementById('startO').classList.remove('show'); endO.classList.remove('show'); newGame(s); };
+function startRun(){ RUN.cleared=0; newGame(1); }
+document.getElementById('startBtn').onclick=()=>{ document.getElementById('startO').classList.remove('show'); startRun(); };
+again.onclick=()=>{ endO.classList.remove('show'); const n=+again.dataset.next; if(n>0) newGame(n); else startRun(); };
+if(location.hash==='#dev') window.__start=(st)=>{ document.getElementById('startO').classList.remove('show'); endO.classList.remove('show'); RUN.cleared=0; newGame(st); };
 requestAnimationFrame(frame);
 })();
 </script>
