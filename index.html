@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Gate Rush</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --ink:#e6edf3; --muted:#8b949e;
+    --blue:#3b82f6; --blue2:#60a5fa; --red:#ef4444; --green:#22c55e;
+    --gold:#f5c518; --track:#1b222c; --track2:#222b37;
+    --accent:#3b82f6;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+  html,body{margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; overflow:hidden; touch-action:none}
+  #wrap{position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center}
+  canvas{display:block; background:var(--track); touch-action:none}
+  #hud{position:fixed; top:0; left:0; right:0; display:flex; justify-content:space-between;
+    align-items:center; padding:10px 14px; pointer-events:none; font-variant-numeric:tabular-nums}
+  #count{font-size:28px; font-weight:800; color:var(--blue2); text-shadow:0 1px 4px #000}
+  #stage{font-size:13px; color:var(--muted)}
+  #best{font-size:13px; color:var(--muted)}
+  .overlay{position:fixed; inset:0; display:none; flex-direction:column; align-items:center;
+    justify-content:center; gap:14px; background:rgba(8,10,14,.86); backdrop-filter:blur(3px); padding:24px; text-align:center}
+  .overlay.show{display:flex}
+  .overlay h1{margin:0; font-size:34px; font-weight:900; letter-spacing:-.5px}
+  .overlay p{margin:0; color:var(--muted); font-size:15px; line-height:1.55; max-width:340px}
+  .big{font-size:40px; font-weight:900}
+  .win{color:var(--green)} .lose{color:var(--red)}
+  button{pointer-events:auto; border:0; border-radius:14px; padding:15px 30px; font-size:17px;
+    font-weight:800; color:#fff; background:var(--accent); cursor:pointer; box-shadow:0 6px 18px rgba(59,130,246,.35)}
+  button:active{transform:translateY(1px)}
+  .hint{font-size:13px; color:var(--muted)}
+  kbd{background:#222b37; border-radius:5px; padding:1px 7px; font-size:12px; border:1px solid #30363d}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+
+<div id="hud">
+  <div id="count">10</div>
+  <div style="text-align:right">
+    <div id="stage">STAGE 1</div>
+    <div id="best"></div>
+  </div>
+</div>
+
+<div class="overlay show" id="startO">
+  <h1>GATE RUSH</h1>
+  <p>게이트를 지나 병력을 불리고, 마지막 <b style="color:var(--red)">붉은 군단</b>을 수로 이겨라.<br>
+  좌우로 움직여 <b style="color:var(--gold)">더 유리한 문</b>을 고르세요.</p>
+  <p class="hint">드래그 / 마우스 이동, 또는 <kbd>←</kbd> <kbd>→</kbd></p>
+  <button id="startBtn">시작</button>
+</div>
+
+<div class="overlay" id="endO">
+  <h1 id="endTitle"></h1>
+  <div class="big" id="endSub"></div>
+  <p id="endMsg"></p>
+  <button id="again">다시</button>
+</div>
+
+<script>
+(()=>{
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+const hudCount=document.getElementById('count'), hudStage=document.getElementById('stage'), hudBest=document.getElementById('best');
+let W=0,H=0,DPR=1;
+function resize(){
+  const maxW=Math.min(window.innerWidth,520);
+  W=maxW; H=window.innerHeight;
+  DPR=Math.min(window.devicePixelRatio||1,2);
+  cv.width=W*DPR; cv.height=H*DPR; cv.style.width=W+'px'; cv.style.height=H+'px';
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener('resize',resize); resize();
+
+// ---- game state ----
+let G;
+function rng(seed){ let s=seed>>>0; return ()=>{ s=(s*1664525+1013904223)>>>0; return s/4294967296; }; }
+
+function newGame(stage=1){
+  const rand=rng(1234+stage*97);
+  const lenBase=4200+stage*900;          // track length (world units)
+  const speed=0.17+stage*0.012;          // forward world-units per ms
+  const objs=[];
+  // --- build level ---
+  let d=700;                              // start distance
+  const end=lenBase;
+  let exp=10;                             // rough expected count, to scale threats fairly
+
+  // GROW INTRO: first 2 pairs both positive, no trap — let the player build up
+  for(let i=0;i<2;i++){
+    const a={op:'+',val:10+Math.round(rand()*14)}, b={op:'×',val:2};
+    objs.push({type:'pair', y:d, left:a, right:b, trapSide:null});
+    exp=Math.round(exp*2);               // assume they grab the good one
+    d+=520+rand()*120;
+  }
+
+  while(d<end-760){
+    const r=rand();
+    if(r<0.50){
+      // GATE PAIR
+      const moving = stage>=2 && rand()<0.2+stage*0.03;
+      const g=makeGatePair(rand,stage);
+      g.y=d; g.moving=moving; g.phase=rand()*6.28;
+      objs.push(g);
+      // track expected (assume decent play: take the better side)
+      exp=Math.max(5, Math.round(applyPreview(exp, g.left, g.right)));
+      // GREED TRAP: strong × gate funnels into a drain right after
+      if(g.trapSide && rand()<0.45){
+        objs.push({type:'drain', y:d+280, side:g.trapSide, rate:0.013+stage*0.004});
+      }
+      d+=540+rand()*150;
+    } else if(r<0.70){
+      // DRAIN (spinning blades): avoidable, on one side
+      const side = rand()<0.5?'L':'R';
+      objs.push({type:'drain', y:d, side, rate:0.012+stage*0.004});
+      d+=470+rand()*150;
+    } else if(r<0.90){
+      // ENEMY BLOB mid-lane: avoidable by dodging to the empty side
+      const cnt=Math.max(6, Math.round(exp*(0.45+rand()*0.6)));
+      const side=rand()<0.5?'L':'R';
+      objs.push({type:'enemy', y:d, side, count:cnt, max:cnt});
+      d+=470+rand()*150;
+    } else {
+      // BONUS lone gate
+      const v=8+Math.round(rand()*12);
+      objs.push({type:'gate', y:d, side:'C', op:'+', val:v, lone:true});
+      exp+=v;
+      d+=380+rand()*120;
+    }
+  }
+  // BOSS at the end — scales with stage; stage1 comfortably beatable with decent play
+  const boss=Math.max(35, Math.round(exp*(0.40+stage*0.05)));
+  objs.push({type:'boss', y:end, count:boss, max:boss});
+
+  G={
+    stage, rand, speed, end,
+    dist:700,                 // world distance traveled (player lead)
+    count:10,
+    px:0.5,                   // player x fraction 0..1
+    targetX:0.5,
+    objs, done:[], state:'play',
+    boss, t0:performance.now(), shake:0
+  };
+  hudStage.textContent='STAGE '+stage;
+  const best=localStorage.getItem('gr_best');
+  hudBest.textContent = best? 'BEST ST '+best : '';
+  updateHud();
+}
+
+function opResult(n,g){
+  if(g.op==='+') return n+g.val;
+  if(g.op==='-') return Math.max(0,n-g.val);
+  if(g.op==='×') return n*g.val;
+  if(g.op==='÷') return Math.max(0,n/g.val);
+  return n;
+}
+function applyPreview(n,L,R){ return Math.max(opResult(n,L),opResult(n,R)); }
+
+function makeGatePair(rand,stage){
+  // returns {type:'pair', left:{op,val}, right:{op,val}, trapSide}
+  const ops=[];
+  const mk=()=>{
+    const r=rand();
+    if(stage>=2 && r<0.22) return {op:'×',val:2};
+    if(stage>=3 && r<0.30) return {op:'×',val:3};
+    if(r<0.52) return {op:'+',val: 6+Math.round(rand()*18)};
+    if(r<0.74) return {op:'-',val: 5+Math.round(rand()*16)};
+    if(r<0.9)  return {op:'÷',val:2};
+    return {op:'×',val:2};
+  };
+  let L=mk(),R=mk();
+  // sometimes force a "both bad" dilemma at higher stages
+  if(stage>=2 && rand()<0.22){ L={op:'-',val:8+Math.round(rand()*20)}; R={op:'÷',val:2}; }
+  // decide which side is the "greedy strong" one -> trap candidate
+  const strength=g=>g.op==='×'?g.val*10: g.op==='+'?g.val : g.op==='-'?-g.val : -5;
+  const trapSide = strength(L)>strength(R)? 'L':'R';
+  return {type:'pair', left:L, right:R, trapSide: (L.op==='×'||R.op==='×')?trapSide:null};
+}
+
+// ---- input ----
+function setTargetFromClientX(cx){
+  const rect=cv.getBoundingClientRect();
+  G && (G.targetX=Math.max(0.08,Math.min(0.92,(cx-rect.left)/rect.width)));
+}
+let dragging=false;
+cv.addEventListener('pointerdown',e=>{dragging=true; setTargetFromClientX(e.clientX);});
+window.addEventListener('pointermove',e=>{ if(dragging) setTargetFromClientX(e.clientX);});
+window.addEventListener('pointerup',()=>dragging=false);
+const keys={};
+window.addEventListener('keydown',e=>{keys[e.key]=true;});
+window.addEventListener('keyup',e=>{keys[e.key]=false;});
+
+// ---- geometry ----
+const trackPad=0.07;               // side margins
+function laneX(frac){ return (trackPad + frac*(1-2*trackPad))*W; }
+function crowdRadius(n){ return Math.max(10, Math.min(W*0.22, 9+Math.sqrt(Math.max(1,n))*2.6)); }
+const PLAYER_SCREEN_Y=()=>H*0.78;  // player fixed near bottom
+function worldToScreenY(wy){ return PLAYER_SCREEN_Y() - (wy - G.dist); }
+
+// ---- update ----
+let last=performance.now();
+function frame(now){
+  const dt=Math.min(40, now-last); last=now;
+  if(G && G.state==='play') step(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+function step(dt){
+  // steer
+  if(keys['ArrowLeft']||keys['a']) G.targetX-=0.0022*dt;
+  if(keys['ArrowRight']||keys['d']) G.targetX+=0.0022*dt;
+  G.targetX=Math.max(0.08,Math.min(0.92,G.targetX));
+  G.px += (G.targetX-G.px)*Math.min(1,0.016*dt);
+  // advance
+  G.dist += G.speed*dt;
+  if(G.shake>0) G.shake-=dt;
+
+  const leadY=G.dist;
+  const px=G.px, prad=crowdRadius(G.count);
+  const pxpix=laneX(px);
+
+  for(const o of G.objs){
+    // DRAIN: continuous loss while crowd overlaps the bladed half (avoidable)
+    if(o.type==='drain'){
+      const within = Math.abs(leadY-o.y)<150;
+      if(within && sideOverlap(o,px,prad)){
+        G.count=Math.max(0,G.count - o.rate*dt);
+        G.shake=Math.max(G.shake,6);
+        if(G.count<1){ return lose('칼날에 전멸'); }
+      }
+      continue;
+    }
+    // ENEMY: instant annihilation when you touch its side (dodge to avoid)
+    if(o.type==='enemy'){
+      if(!o.hit && leadY>=o.y){
+        if(sideOverlap(o,px,prad) && o.count>0){
+          const m=Math.min(G.count,o.count);
+          G.count-=m; o.count-=m; G.shake=Math.max(G.shake,7);
+          if(G.count<1){ return lose('적 부대에 막혔다'); }
+        }
+        o.hit=true;
+      }
+      continue;
+    }
+    // BOSS: full width, unavoidable — need the numbers
+    if(o.type==='boss'){
+      if(!o.hit && leadY>=o.y){
+        const m=Math.min(G.count,o.count);
+        G.count-=m; o.count-=m; o.hit=true; G.shake=20;
+        if(o.count>0){ return lose('군단을 뚫지 못했다'); }
+        return win();
+      }
+      continue;
+    }
+    // GATES (apply once as the lead crosses)
+    if(o.hit) continue;
+    if(o.type==='pair'){
+      if(leadY>=o.y){
+        const curOff = o.moving? Math.sin(now/650+o.phase)*0.14 : 0;
+        const chooseRight = px > (0.5+curOff);
+        const g= chooseRight? o.right : o.left;
+        applyOp(g); o.hit=true; o.chosen=chooseRight?'R':'L';
+      }
+    } else if(o.type==='gate'){
+      if(leadY>=o.y){
+        if(o.side==='C' || sideOverlap(o,px,prad)){ applyOp(o); }
+        o.hit=true;
+      }
+    }
+  }
+  updateHud();
+}
+function sideOverlap(o,px,prad){
+  // object occupies left or right half; check player's crowd overlaps that half near center line
+  const pxpix=laneX(px), half=W*0.5;
+  if(o.side==='L') return pxpix-prad*0.4 < half;
+  if(o.side==='R') return pxpix+prad*0.4 > half;
+  return true;
+}
+function applyOp(g){
+  const before=G.count;
+  if(g.op==='+') G.count+=g.val;
+  else if(g.op==='-') G.count=Math.max(0,G.count-g.val);
+  else if(g.op==='×') G.count=Math.round(G.count*g.val);
+  else if(g.op==='÷') G.count=Math.max(0,Math.round(G.count/g.val));
+  if(G.count<1){ lose('병력이 0이 됐다'); }
+}
+function updateHud(){ hudCount.textContent=Math.floor(G.count); }
+
+// ---- draw ----
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  // track
+  const sx=(G&&G.shake>0)?(Math.random()*2-1)*2:0;
+  ctx.save(); ctx.translate(sx,0);
+  // track stripes
+  ctx.fillStyle=getCSS('--track'); ctx.fillRect(0,0,W,H);
+  const left=laneX(0)- crowdRadius(1), right=laneX(1)+crowdRadius(1);
+  ctx.fillStyle=getCSS('--track2');
+  ctx.fillRect(trackPad*W*0.5,0, (1-trackPad)*W*0.0,H);
+  // moving stripe lines for speed feel
+  const stripeH=90; const off=(G? (G.dist% stripeH):0);
+  ctx.strokeStyle='rgba(255,255,255,.04)'; ctx.lineWidth=2;
+  for(let y=-stripeH+off%stripeH; y<H; y+=stripeH){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+  // center divider
+  ctx.setLineDash([10,14]); ctx.strokeStyle='rgba(255,255,255,.10)';
+  ctx.beginPath(); ctx.moveTo(W/2,0); ctx.lineTo(W/2,H); ctx.stroke(); ctx.setLineDash([]);
+  // side walls
+  ctx.fillStyle='rgba(255,255,255,.05)';
+  ctx.fillRect(trackPad*W-10,0,6,H); ctx.fillRect((1-trackPad)*W+4,0,6,H);
+
+  if(G){
+    // objects
+    for(const o of G.objs){
+      const sy=worldToScreenY(o.y);
+      if(sy<-260||sy>H+260) continue;
+      if(o.type==='pair') drawPair(o,sy);
+      else if(o.type==='gate') drawLone(o,sy);
+      else if(o.type==='drain') drawDrain(o,sy);
+      else if(o.type==='enemy') drawEnemy(o,sy);
+      else if(o.type==='boss') drawBoss(o,sy);
+    }
+    // player crowd
+    drawCrowd(laneX(G.px), PLAYER_SCREEN_Y(), G.count, true);
+    // progress bar
+    const prog=Math.max(0,Math.min(1,(G.dist-700)/(G.end-700)));
+    ctx.fillStyle='rgba(255,255,255,.08)'; ctx.fillRect(14,H-16,W-28,6);
+    ctx.fillStyle=getCSS('--blue'); ctx.fillRect(14,H-16,(W-28)*prog,6);
+  }
+  ctx.restore();
+}
+function getCSS(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+function gateColor(g){
+  if(g.op==='×') return '#f5c518';
+  if(g.op==='+') return '#2f9e44';
+  if(g.op==='-') return '#e8590c';
+  if(g.op==='÷') return '#c92a2a';
+  return '#555';
+}
+function gateLabel(g){ return g.op+g.val; }
+function drawGateBar(x0,x1,y,g,dim){
+  const h=46; const col=gateColor(g);
+  ctx.globalAlpha=dim?0.5:1;
+  ctx.fillStyle=col; roundRect(x0+6,y-h/2,(x1-x0)-12,h,10); ctx.fill();
+  ctx.fillStyle='rgba(0,0,0,.18)'; ctx.fillRect(x0+6,y+h/2-7,(x1-x0)-12,7);
+  ctx.fillStyle='#111'; ctx.font='800 24px system-ui'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(gateLabel(g),(x0+x1)/2,y);
+  ctx.globalAlpha=1;
+}
+function drawPair(o,sy){
+  let mid=0.5;
+  if(o.moving){ mid=0.5+Math.sin(performance.now()/650+o.phase)*0.14; }
+  const midX=laneX(mid);
+  const L0=trackPad*W, R1=(1-trackPad)*W;
+  drawGateBar(L0,midX,sy,o.left, o.hit&&o.chosen==='R');
+  drawGateBar(midX,R1,sy,o.right, o.hit&&o.chosen==='L');
+  if(o.moving){ ctx.fillStyle='rgba(255,255,255,.5)'; ctx.fillRect(midX-1,sy-30,2,60); }
+}
+function drawLone(o,sy){
+  const w=W*0.3, x=W/2-w/2;
+  drawGateBar(x,x+w,sy,o,o.hit);
+  ctx.fillStyle=getCSS('--muted'); ctx.font='11px system-ui'; ctx.textAlign='center';
+  ctx.fillText('BONUS',W/2,sy-32);
+}
+function drawDrain(o,sy){
+  const cx = o.side==='L'? laneX(0.26): laneX(0.74);
+  const t=performance.now()/200;
+  ctx.save(); ctx.translate(cx,sy); ctx.rotate(t);
+  ctx.fillStyle='#8b949e';
+  for(let i=0;i<4;i++){ ctx.rotate(Math.PI/2); roundRect(-7,-46,14,46,6); ctx.fill(); }
+  ctx.restore();
+  ctx.fillStyle='#30363d'; ctx.beginPath(); ctx.arc(cx,sy,12,0,7); ctx.fill();
+  ctx.fillStyle='rgba(239,68,68,.12)';
+  const bx= o.side==='L'? trackPad*W : W/2;
+  ctx.fillRect(bx,sy-70,(W/2-trackPad*W),140);
+}
+function drawEnemy(o,sy){
+  if(o.count<=0) return;
+  const cx= o.side==='L'? laneX(0.28): laneX(0.72);
+  drawCrowd(cx,sy,o.count,false);
+}
+function drawBoss(o,sy){
+  if(o.count<=0) return;
+  drawCrowd(W/2,sy,o.count,false,true);
+  ctx.fillStyle=getCSS('--red'); ctx.font='800 13px system-ui'; ctx.textAlign='center';
+  ctx.fillText('BOSS',W/2,sy-crowdRadius(o.count)-24);
+}
+function drawCrowd(cx,cy,count,blue,boss){
+  const n=Math.floor(count); if(n<=0) return;
+  const r=crowdRadius(n)*(boss?1.15:1);
+  const shown=Math.min(n, boss?260:180);
+  // base glow
+  ctx.fillStyle = blue? 'rgba(59,130,246,.16)':'rgba(239,68,68,.16)';
+  ctx.beginPath(); ctx.arc(cx,cy,r*1.15,0,7); ctx.fill();
+  // dots
+  for(let i=0;i<shown;i++){
+    const a=i*2.399963; const rr=r*Math.sqrt(i/shown);
+    const x=cx+Math.cos(a)*rr, y=cy+Math.sin(a)*rr*0.9;
+    ctx.fillStyle= blue? (i%7?'#3b82f6':'#60a5fa') : (i%7?'#ef4444':'#f87171');
+    ctx.beginPath(); ctx.arc(x,y,2.4,0,7); ctx.fill();
+  }
+  // label
+  ctx.fillStyle='#fff'; ctx.font='800 '+(boss?22:16)+'px system-ui';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.strokeStyle='rgba(0,0,0,.6)'; ctx.lineWidth=3;
+  const ly=cy - r - (boss?14:10);
+  ctx.strokeText(n, cx, ly); ctx.fillText(n, cx, ly);
+}
+function roundRect(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+
+// ---- end states ----
+const endO=document.getElementById('endO'), endTitle=document.getElementById('endTitle'),
+      endSub=document.getElementById('endSub'), endMsg=document.getElementById('endMsg');
+function win(){
+  G.state='end';
+  const next=G.stage+1;
+  const best=Math.max(G.stage, +(localStorage.getItem('gr_best')||0));
+  localStorage.setItem('gr_best',best);
+  endTitle.textContent='승리'; endTitle.className='win';
+  endSub.textContent='STAGE '+G.stage+' 돌파';
+  endMsg.textContent='남은 병력 '+Math.floor(G.count)+'. 다음 스테이지는 보스가 더 강해집니다.';
+  document.getElementById('again').textContent='다음 스테이지 ▶';
+  document.getElementById('again').dataset.next=next;
+  endO.classList.add('show');
+}
+function lose(reason){
+  if(G.state==='end') return;
+  G.state='end';
+  endTitle.textContent='패배'; endTitle.className='lose';
+  endSub.textContent=reason;
+  endMsg.textContent='STAGE '+G.stage+'에서 멈췄습니다. 더 유리한 문을 노려보세요.';
+  document.getElementById('again').textContent='재도전';
+  document.getElementById('again').dataset.next=G.stage;
+  endO.classList.add('show');
+}
+document.getElementById('startBtn').onclick=()=>{ document.getElementById('startO').classList.remove('show'); newGame(1); };
+document.getElementById('again').onclick=(e)=>{ endO.classList.remove('show'); newGame(+e.target.dataset.next||1); };
+
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
